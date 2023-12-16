@@ -7,31 +7,6 @@ import Utils as utils
 from torch.distributions import MultivariateNormal, Independent, Normal, Categorical
 from Utils import gaussian_posterior, sample_cov
 
-class KalmanFilter():
-    def __init__(self, x_0, P_0, F, G, U, V):
-        self.x, self.P, self.F, self.G, self.U, self.V = \
-            x_0, P_0, F, G, U, V
-
-    def update(self, y):
-        '''
-        Update function of the Kalman Filter. 
-        1-Compute xp=F*x. (initial esimation of x)
-        2-Compute Pp=F*P*F^{T}+U (initial esimation of P)
-        3-Compute S=G*Pp*G^{T}+V
-        4-Compute K=Pp*G^{T}*S^{-1}
-        5-Compute z=y-G*xp
-        6-Compute x = xp + K*z (adapted estimation of x)
-        7-Compute P = (I-K*G)*Pp (adapted estimation of P)
-        '''
-        xp = np.dot(self.F, self.x)
-        Pp = np.matmul(np.matmul(self.F, self.P), np.transpose(self.F)) + self.U
-        S = np.matmul(np.matmul(self.G, Pp), np.transpose(self.G)) + self.V
-        K = np.matmul(np.matmul(Pp, np.transpose(self.G)), np.linalg.inv(S))
-        z = y - np.dot(self.G, xp)
-
-        self.x = xp + np.dot(K, z)
-        self.P = np.matmul(np.eye(self.P.shape[0]) - np.matmul(K, self.G), Pp)
-
 class NonAmortisedGaussianModels(nn.Module):
     '''
     NonAmortisedModels is a class that is meant to be a neural network model in the PyTorch framework. 

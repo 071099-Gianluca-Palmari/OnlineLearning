@@ -45,6 +45,8 @@ def main(cfg):
 
     # ------------------- Construct data -----------------------
 
+
+
     DIM = cfg.data.dim
 
     if not cfg.data.diagFG:
@@ -100,8 +102,8 @@ def main(cfg):
     kalman_xs_pyt = torch.from_numpy(kalman_xs).float()
     kalman_Ps_pyt = torch.from_numpy(kalman_Ps).float()
 
-
-    F_init, G_init, _, _ = construct_HMM_matrices(dim=DIM,
+    # _ instead of F_init
+    _, G_init, _, _ = construct_HMM_matrices(dim=DIM,
                                             F_eigvals=np.random.uniform(
                                                 cfg.data.F_min_eigval,
                                                 cfg.data.F_max_eigval, (DIM)),
@@ -117,7 +119,7 @@ def main(cfg):
     F = torch.from_numpy(F).float().to(device)
     G = torch.from_numpy(G).float().to(device)
 
-    F_init = torch.from_numpy(F_init).float().to(device)
+    #F_init = torch.from_numpy(F_init).float().to(device)
     G_init = torch.from_numpy(G_init).float().to(device)
 
     U = torch.from_numpy(U).float().to(device)
@@ -132,18 +134,33 @@ def main(cfg):
 
 
     class F_Module(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.register_parameter('weight',
-                nn.Parameter(torch.zeros(DIM)))
-            self.F_mean_fn = lambda x, t: self.weight * x
-            self.F_cov_fn = lambda x, t: U
-            self.F_cov = U
+        def __init__(self, input_dim):
+            super(MyCustomModule, self).__init__()
+            # Encoder
+            self.encoder = nn.Sequential(
+                nn.Conv1d(1, 64, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(),
+                nn.Conv1d(64, 32, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(),
+                nn.Conv1d(32, input_dim, kernel_size=3, stride=1, padding=1)
+            )
 
-        def forward(self, x, t=None):
-            return Independent(Normal(self.F_mean_fn(x, t),
-                torch.sqrt(torch.diag(U))), 1)
+            # Decoder
+            self.decoder = nn.Sequential(
+                nn.Conv1d(input_dim, 32, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(),
+                nn.Conv1d(32, 64, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(),
+                nn.Conv1d(64, input_dim - 1, kernel_size=3, stride=1, padding=1)
+            )
 
+        def forward(self, x):
+            x = x.unsqueeze(1)  # Add channel dimension for Conv1d
+            encoded_output = self.encoder(x)
+            decoded_output = self.decoder(encoded_output)
+            decoded_output = decoded_output.squeeze(1)  # Remove channel dimension
+            return decoded_output
+            
     class G_Module(nn.Module):
         def __init__(self):
             super().__init__()

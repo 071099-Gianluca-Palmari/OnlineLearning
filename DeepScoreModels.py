@@ -86,6 +86,24 @@ class NonAmortisedDeepScoreModels(nn.Module):
             params = params + [*self.cond_q_t_mean_net_list[t].parameters(), self.cond_q_t_log_std_list[t]]
         return params
 
+    def compute_score_p_y_t(self, x_t, y_t, t=None):\
+        '''
+        Compute the score: \partial_{x}\log(p(y:t,x))
+        '''
+        if t is None:
+            t = self.T
+        # Clone x_t, detach, and require gradients
+        xt = x_t.clone().detach().requires_grad_()
+        # Get the distribution for y_t given x_t
+        y_distribution = self.Pi_fn(xt, t)
+        # Compute the log likelihood
+        log_likelihood_p_y_t = y_distribution.log_prob(y_t).unsqueeze(1)
+        # Backward pass to compute gradients
+        log_likelihood_p_y_t.backward()
+        # Access the gradient with respect to x_t
+        score_p_y_t = xt.grad
+        return score_p_y_t
+
     def compute_log_p_y_t(self, x_t, y_t, x_tm1=None, t=None):
         """
             Compute log p(y_t | x_t)
@@ -94,7 +112,7 @@ class NonAmortisedDeepScoreModels(nn.Module):
         if t is None:
             t = self.T
         log_p_y_t = self.Pi_fn(x_t, t).log_prob(y_t).unsqueeze(1)
-        return {"log_p_y_t": log_p_y_t}
+        return log_p_y_t
 
     def sample_q_t_cond_T(self, x_T, num_steps_back, detach_x=False, T=None):
         if T is None:
@@ -152,12 +170,12 @@ class NonAmortisedDeepScoreModels(nn.Module):
 
         return x_t_samples + [x_T_samples], all_cond_q_t_stats
 
-    def compute_log_q_xtm1_cond_xt(self, x_t, x_tm1, *q_tm1_stats):
+    def compute_log_q_xtm1_cond_xt(self, x_t, x_tm1, W, b, cond_q_t_log_std):
         """
-            Compute log q(x_t | x_{t+1}) (independent Gaussian inference model)
+            Compute log q(x_t-1 | x_{t}) (independent Gaussian inference model)
         """
-        assert len(q_tm1_stats) == 2
-        return Independent(Normal(*q_tm1_stats), 1).log_prob(x_t).unsqueeze(1)
+        
+        return Independent(Normal(x_t), 1).log_prob(x_t).unsqueeze(1)
         
     def compute_r_t(self, x_t, y_t, *q_tm1_stats, x_tm1=None, t=None):
         if t is None:
@@ -186,7 +204,6 @@ class NonAmortisedDeepScoreModels(nn.Module):
             x_tm1, cond_q_tm1_stats = x_tm1[0], cond_q_tm1_stats[0]
             r_t = self.compute_r_t(x_t_dispersed, y_t, *cond_q_tm1_stats, x_tm1=x_tm1, t=t)
         return {"x_tm1": x_tm1, "x_t": x_t_dispersed, "r_t": r_t}
-
 
     def sample_and_compute_joint_r_t(self, x_T,  y, num_samples, window_size, detach_x=False, only_return_first_r=False,
                                      T=None):
@@ -260,3 +277,239 @@ class NonAmortisedDeepScoreModels(nn.Module):
             x_t_mean = x_Tm1_samples.mean(0).detach().clone()
             x_t_cov = sample_cov(x_Tm1_samples).detach().clone()
         return x_t_mean, x_t_cov
+
+
+# ------------------------ V function --------------------
+
+class Vx_t_phi_t_Model(NonAmortizedModelBased):
+    '''
+    Subclass of NonAmortizedModelsBased. 
+    Class that defines the V function. 
+    We initialize it with the arguments of the NonAmortizedModelsBased class plus a constructor for V function, 
+    init_sigma_median, an approx decay, approx with filter boolean and the num of params to store. 
+    '''
+    def __init__(self, device, xdim, ydim, q_0_mean, q_0_log_std, cond_q_mean_net_constructor, cond_q_0_log_std,
+                 F_fn, G_fn, p_0_dist, phi_t_init_method, window_size,
+                 V_func_constructor, init_sigma_median, approx_decay, approx_with_filter,
+                 num_params_to_store=None):
+        super().__init__(device, xdim, ydim, q_0_mean, q_0_log_std, cond_q_mean_net_constructor, cond_q_0_log_std,
+                 F_fn, G_fn, p_0_dist, phi_t_init_method, window_size,
+                 num_params_to_store=None)
+        self.V_func_constructor = V_func_constructor # we give a constructor to the class. Used in advance step
+        self.init_sigma_median = init_sigma_median
+        self.approx_decay = approx_decay
+        self.approx_with_filter = approx_with_filter
+
+    def advance_timestep(self, y_T):
+        '''
+        Defines V, or update Vt with Vtm1 informations
+        '''
+        super().advance_timestep(y_T) 
+        if self.T = self.window_size - 1: 
+            self.V_func_t = self.V_func_constructor # since we have a window size equal to the total time length
+        elif self.T >= self.window_size:
+            self.V_func_tm1 = self.V_func_t # Vt becomes Vtm1 so we can define the new Vt
+            self.V_func_t = self.V_func_constructor # we give a structure to Vt
+            self.V_func_t.load_state_dict(self.V_func_tm1.state_dict()) # we load the init weights from Vtm1
+            self.V_func_tm1.requires_grad_(False) # we freeze the gradients since now we will backpro only Vt
+            self.V_func_tm1.eval() #  to ensure consistent and deterministic behavior during inference.
+
+    def update_V_t(self, y, num_samples, t=None, disperse_temp=1):
+        '''
+        Function that updates Vt using the iterative identity:
+            V_{t} = \E_{q_{t}^{\phi}(xt-1|xt)}[V_{t-1]}+r_{t}(x_{t-1},x_{t})]
+        '''
+        if t is None:
+            t = self.T  - self.window_size - 1 # if window_size = 1, we update V_T
+        elif t >= 0:
+            r_results = self.compute_r_t(y, num_samples, detach_x=False, t=t, disperse_temp=disperse_temp)
+            x_t = r_results['x_t']
+            r_t = r_results['r_t']
+            
+            if t == 0:
+                if self.approx_with_filter:
+                    log_q_t = self.compute_log_q_t(x_t, self.q_t_mean_list[t].detach(),
+                                                   self.q_t_log_std_list[t].detach().exp())
+                    r_t -= log_q_t
+                dr_t_x_t = torch.autograd.grad(r_t.sum(), x_t, retain_graph=True)[0]
+                Vx_tm1_dx_tm1_x_t = torch.zeros_like(dr_t_x_t)
+                V_tm1 = torch.zeros_like(r_t)
+
+            else:
+                x_tm1 = r_results["x_tm1"]
+                if self.approx_with_filter:
+                    log_q_t = self.compute_log_q_t(x_t, self.q_t_mean_list[t].detach(),
+                                                   self.q_t_log_std_list[t].detach().exp())
+                    log_q_tm1 = self.compute_log_q_t(x_tm1, self.q_t_mean_list[t-1].detach(),
+                                                     self.q_t_log_std_list[t-1].detach().exp())
+                    r_t += (log_q_tm1 - log_q_t)
+                dr_t_x_t = torch.autograd.grad(r_t.sum(), x_t, retain_graph=True)[0]
+                with torch.no_grad():# factory function exception
+                    Vx_tm1, V_tm1 = self.V_func_tm1(x_tm1)
+                Vx_tm1_dx_tm1_x_t = torch.autograd.grad((Vx_tm1 * x_tm1).sum(),
+                                                        x_t, retain_graph=True)[0]
+
+        # Fit new V_func with KRR regression
+            if self.init_sigma_median and t == 0:#we are at time 0, so we need to init the kernel
+                self.V_func_t.kernel.log_sigma.data = torch.tensor(
+                    np.log(utils.estimate_median_distance(x_t)).astype(float)).to(self.device)
+                print("Update bandwidth to ", self.V_func_t.kernel.log_sigma.exp().item())
+            # fitting step 
+            self.V_func_t.fit(x_t.detach(),
+                              (dr_t_x_t + self.approx_decay * Vx_tm1_dx_tm1_x_t).detach(),
+                              (r_t + self.approx_decay * V_tm1).detach())
+        else:
+            print("t < 0, V_t not updated")
+
+class Vx_t_phi_t_Model(NonAmortizedModelBase):
+    def __init__(self, device, xdim, ydim, q_0_mean, q_0_log_std, cond_q_mean_net_constructor, cond_q_0_log_std,
+                 F_fn, G_fn, p_0_dist, phi_t_init_method, window_size,
+                 V_func_constructor, init_sigma_median, approx_decay, approx_with_filter,
+                 num_params_to_store=None):
+        super().__init__(device, xdim, ydim, q_0_mean, q_0_log_std, cond_q_mean_net_constructor, cond_q_0_log_std,
+                         F_fn, G_fn, p_0_dist, phi_t_init_method, window_size,
+                         num_params_to_store)
+        self.V_func_constructor = V_func_constructor # we give a constructor to the class. Used in advance step
+        self.init_sigma_median = init_sigma_median # initialization of sigma median 
+        # self.V_func_t = self.V_func_constructor()
+        self.approx_decay = approx_decay # we give an approx decay
+        self.approx_with_filter = approx_with_filter # we tell to the model if we approx with filter or not 
+
+    def advance_timestep(self, y_T):
+        '''
+        Defines V, or update Vt with Vtm1 informations
+        '''
+        super().advance_timestep(y_T)
+        if self.T == self.window_size - 1:
+            self.V_func_t = self.V_func_constructor() # means that we are in the first step, V is only constructed. nothing more
+
+        elif self.T > self.window_size - 1:
+            self.V_func_tm1 = self.V_func_t # Vt becomes Vtm1
+            self.V_func_t = self.V_func_constructor() # We use the initial constructor to create Vt
+            self.V_func_t.load_state_dict(self.V_func_tm1.state_dict()) # we load the states of time t-1 and put them into Vt as initialization
+            self.V_func_tm1.requires_grad_(False) # remove the gradients 
+            self.V_func_tm1.eval() # always do it before testing it 
+
+    def update_V_t(self, y, num_samples, t=None, disperse_temp=1):
+        """
+            Updates V_t using q(x_{tm1:T})
+            V_{t} = \E_{q_{t}^{\phi}(xt-1|xt)}[V_{t-1]}+r_{t}(x_{t-1},x_{t})]
+        """
+        if t is None:
+            t = self.T - self.window_size + 1  # By default, we update V_t at time T (V_T when window_size=1)
+        if t >= 0:
+            # self.zero_grad()
+
+            r_results = self.sample_and_compute_r_t(y[t, :], num_samples, t=t, disperse_temp=disperse_temp)
+            x_t = r_results["x_t"]
+            r_t = r_results["r_t"]
+
+            if t == 0:
+                if self.approx_with_filter:
+                    log_q_t = self.compute_log_q_t(x_t, self.q_t_mean_list[t].detach(),
+                                                   self.q_t_log_std_list[t].detach().exp())
+                    r_t -= log_q_t
+                dr_t_x_t = torch.autograd.grad(r_t.sum(), x_t, retain_graph=True)[0]
+                Vx_tm1_dx_tm1_x_t = torch.zeros_like(dr_t_x_t)
+                V_tm1 = torch.zeros_like(r_t)
+
+            else:
+                x_tm1 = r_results["x_tm1"]
+                if self.approx_with_filter:
+                    log_q_t = self.compute_log_q_t(x_t, self.q_t_mean_list[t].detach(),
+                                                   self.q_t_log_std_list[t].detach().exp())
+                    log_q_tm1 = self.compute_log_q_t(x_tm1, self.q_t_mean_list[t-1].detach(),
+                                                     self.q_t_log_std_list[t-1].detach().exp())
+                    r_t += (log_q_tm1 - log_q_t)
+                dr_t_x_t = torch.autograd.grad(r_t.sum(), x_t, retain_graph=True)[0]
+                with torch.no_grad():# factory function exception
+                    Vx_tm1, V_tm1 = self.V_func_tm1(x_tm1)
+                Vx_tm1_dx_tm1_x_t = torch.autograd.grad((Vx_tm1 * x_tm1).sum(),
+                                                        x_t, retain_graph=True)[0]
+
+            # Fit new V_func
+            if self.init_sigma_median and t == 0:
+                self.V_func_t.kernel.log_sigma.data = torch.tensor(
+                    np.log(utils.estimate_median_distance(x_t)).astype(float)).to(self.device)
+                print("Update bandwidth to ", self.V_func_t.kernel.log_sigma.exp().item())
+
+            self.V_func_t.fit(x_t.detach(),
+                              (dr_t_x_t + self.approx_decay * Vx_tm1_dx_tm1_x_t).detach(),
+                              (r_t + self.approx_decay * V_tm1).detach())
+        else:
+            print("t < 0, V_t not updated")
+
+    def V_t_loss(self, y, num_samples, t=None, disperse_temp=1):
+        if t is None:
+            t = self.T - self.window_size + 1  # By default, we update V_t at time T (V_T when window_size=1)
+        if t >= 0:
+            self.V_func_t.train()
+            # self.zero_grad()
+
+            r_results = self.sample_and_compute_r_t(y[t, :], num_samples, t=t, disperse_temp=disperse_temp)
+            x_t = r_results["x_t"]
+            r_t = r_results["r_t"]
+
+            if t == 0:
+                if self.approx_with_filter:
+                    log_q_t = self.compute_log_q_t(x_t, self.q_t_mean_list[t].detach(),
+                                                   self.q_t_log_std_list[t].detach().exp())
+                    r_t -= log_q_t
+                dr_t_x_t = torch.autograd.grad(r_t.sum(), x_t, retain_graph=True)[0]
+                Vx_tm1_dx_tm1_x_t = torch.zeros_like(dr_t_x_t)
+                V_tm1 = torch.zeros_like(r_t)
+
+            else:
+                x_tm1 = r_results["x_tm1"]
+                if self.approx_with_filter:
+                    log_q_t = self.compute_log_q_t(x_t, self.q_t_mean_list[t].detach(),
+                                                   self.q_t_log_std_list[t].detach().exp())
+                    log_q_tm1 = self.compute_log_q_t(x_tm1, self.q_t_mean_list[t - 1].detach(),
+                                                     self.q_t_log_std_list[t - 1].detach().exp())
+                    r_t += (log_q_tm1 - log_q_t)
+                dr_t_x_t = torch.autograd.grad(r_t.sum(), x_t, retain_graph=True)[0]
+                with torch.no_grad():
+                    Vx_tm1, V_tm1 = self.V_func_tm1(x_tm1)
+                Vx_tm1_dx_tm1_x_t = torch.autograd.grad((Vx_tm1 * x_tm1).sum(),
+                                                        x_t, retain_graph=True)[0]
+
+            preds = self.V_func_t(x_t.detach())[0]
+            targets = (dr_t_x_t + self.approx_decay * Vx_tm1_dx_tm1_x_t).detach()
+
+            # preds = self.V_func_t(x_t.detach())[1]
+            # targets = (r_t + self.approx_decay * V_tm1).detach()
+
+            return torch.mean((preds - targets) ** 2), preds, targets
+
+        else:
+            print("t < 0, V_t not updated")
+
+    def populate_phi_grads(self, y, num_samples):
+        # self.zero_grad()
+
+        all_r_results = self.sample_and_compute_joint_r_t(y, num_samples, min(self.window_size, self.T + 1))
+
+        r_values = all_r_results["r_values"]
+        sum_r = sum(r_values)
+        log_q_x_T = all_r_results["log_q_x_T"]
+
+        if self.T < self.window_size:
+            Vx_tm1_x_tm1 = torch.zeros_like(sum_r)
+            V_tm1 = torch.zeros_like(sum_r)
+
+        else:
+            x_tm1 = all_r_results["x_samples"][0]
+            with torch.no_grad():
+                Vx_tm1, V_tm1 = self.V_func_tm1(x_tm1)
+            Vx_tm1_x_tm1 = (Vx_tm1 * x_tm1).sum(1, keepdim=True)
+            if self.approx_with_filter:
+                log_q_x_tm1 = self.compute_log_q_t(x_tm1, self.q_t_mean_list[self.T - self.window_size].detach(),
+                                                   self.q_t_log_std_list[self.T - self.window_size].detach().exp())
+                sum_r += log_q_x_tm1
+
+        loss = - (sum_r + Vx_tm1_x_tm1 - log_q_x_T - Vx_tm1_x_tm1.detach() + V_tm1.detach()).mean()
+        loss.backward()
+        return loss
+
+    def get_V_t_params(self):
+        return self.V_func_t.parameters()
