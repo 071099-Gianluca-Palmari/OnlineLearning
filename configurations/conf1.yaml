@@ -1,0 +1,9 @@
+defaults:
+  - globals
+  - data: linear_gaussian_for_config1.yaml
+
+name: "Theta_training"
+
+device: "cpu"
+seed: null
+save_models: True

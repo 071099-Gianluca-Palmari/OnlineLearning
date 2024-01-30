@@ -207,6 +207,20 @@ class NonAmortizedModelBase(nn.Module):
         log_p_y_t = self.G_fn(x_t, t).log_prob(y_t).unsqueeze(1)
         return {"log_p_x_t": log_p_x_t, "log_p_y_t": log_p_y_t}
 
+    def compute_log_p_t_with_score(self, x_t, y_t, s_tm1=None, x_tm1=None, t=None):
+        """
+            Compute log p(x_t | x_{t-1}, s_{t-1}) and log p(y_t | x_t)
+            t is set to self.T if not specified
+        """
+        if t is None:
+            t = self.T
+        if t == 0:
+            log_p_x_t = self.p_0_dist().log_prob(x_t).unsqueeze(1)
+        else:
+            log_p_x_t = self.F_fn(x_tm1, s_tm1, t-1).log_prob(x_t).unsqueeze(1)
+        log_p_y_t = self.G_fn(x_t, t).log_prob(y_t).unsqueeze(1)
+        return {"log_p_x_t": log_p_x_t, "log_p_y_t": log_p_y_t}
+
     def compute_log_q_t(self, x_t, *q_t_stats):
         """
             Compute log q(x_t | x_{t+1}) (independent Gaussian inference model)
@@ -285,6 +299,38 @@ class NonAmortizedModelBase(nn.Module):
 
         for t in range(T):
             y_t = self.G_fn(x[t, :], t).sample()
+            x_tp1 = self.F_fn(x[t, :], t).sample()
+
+            y[t, :] = y_t
+            if t < T-1:
+                x[t+1, :] = x_tp1
+
+        return x, y
+
+    def score_function(self, x, y):
+        '''
+        For y = N(G(x),V(x))
+        s_{t} = -\frac{1}{2} [ \frac{V'(x_{t})}{V(x_{t})}  +  \frac{G'(x_{t})V(x_{t})-G(x_{t})V'(x_{t})}{V(x_{t})^{2}}    ]
+        '''
+        G_x = self.G_fn(x)
+        G_prime = torch.autograd.grad(G_x, x, grad_outputs=torch.ones_like(G_x_t), retain_graph=True)[0]
+
+        s = G_x/G_prime
+
+        return s
+
+
+    def generate_data_with_score(self, T):
+        # Generates hidden states and observations up to time T
+        x = torch.zeros((T, self.xdim)).to(self.device)
+        s = torch.zeros((T, self.xdim)).to(self.device)
+        y = torch.zeros((T, self.ydim)).to(self.device)
+
+        x[0, :] = self.p_0_dist().sample()
+
+        for t in range(T):
+            y_t = self.G_fn(x[t, :], t).sample()
+            s_t = score_function(y_t)
             x_tp1 = self.F_fn(x[t, :], t).sample()
 
             y[t, :] = y_t

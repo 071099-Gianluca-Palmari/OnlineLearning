@@ -209,8 +209,6 @@ def main(cfg):
     # ------------------- Create phi model ------------------------
 
 
-
-
     def cond_q_mean_net_constructor():
         return torch.nn.Linear(DIM, DIM).to(device)
 

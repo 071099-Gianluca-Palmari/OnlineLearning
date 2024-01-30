@@ -1,0 +1,13 @@
+/home/gpalmari/OnlineLearning/Linear_Gaussian_Score_Model.py:31: UserWarning: 
+The version_base parameter is not specified.
+Please specify a compatability version level, or None.
+Will assume defaults for version 1.1
+  @hydra.main(config_path='configurations', config_name="conf1")
+/home/gpalmari/.conda/envs/signature_JC_env/lib/python3.8/site-packages/hydra/_internal/defaults_list.py:251: UserWarning: In 'conf1': Defaults list is missing `_self_`. See https://hydra.cc/docs/1.2/upgrades/1.0_to_1.1/default_composition_order for more information
+  warnings.warn(msg, UserWarning)
+/home/gpalmari/.conda/envs/signature_JC_env/lib/python3.8/site-packages/hydra/core/default_element.py:124: UserWarning: In 'data/linear_gaussian_for_config1.yaml': Usage of deprecated keyword in package header '# @package _group_'.
+See https://hydra.cc/docs/1.2/upgrades/1.0_to_1.1/changes_to_package_header for more information
+  deprecation_warning(
+/home/gpalmari/.conda/envs/signature_JC_env/lib/python3.8/site-packages/hydra/_internal/hydra.py:119: UserWarning: Future Hydra versions will no longer change working directory at job runtime by default.
+See https://hydra.cc/docs/1.2/upgrades/1.1_to_1.2/changes_to_job_working_dir/ for more information.
+  ret = run_job(
