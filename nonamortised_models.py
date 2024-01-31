@@ -17,7 +17,7 @@ class NonAmortizedModelBase(nn.Module):
         F, G are nn.Modules which return a distribution and can potentially contain learnable theta parameters
         The q lists contain nonamortized variational posteriors
             q_t(x_t) = N(x_t; q_T_mean, diag(q_T_std)^2)
-            q_t(x_{t-1} | x_t) = N(x_{t-1}; cond_q_t_mean_net(x_t), diag(cond_q_t_std)^2)
+            k_t(x_{t-1} | x_t) = N(x_{t-1}; cond_q_t_mean_net(x_t), diag(cond_q_t_std)^2)
             These will both be factorized Gaussians.
         cond_q_t_mean_net: Linear, MLP, etc: (xdim) -> (xdim)
     """
@@ -26,7 +26,6 @@ class NonAmortizedModelBase(nn.Module):
                  F_fn, G_fn, p_0_dist, phi_t_init_method, window_size, num_params_to_store=None):
         super().__init__()
         self.T = -1
-
         self.device = device
         self.xdim = xdim
         self.ydim = ydim
@@ -75,7 +74,6 @@ class NonAmortizedModelBase(nn.Module):
                 F_jac = torch.autograd.functional.jacobian(partial(self.F_fn.F_mean_fn, t=self.T-1), test_x)
                 F_cov = self.F_fn.F_cov_fn(self.q_t_mean_list[self.T-1], self.T-1)
                 pred_cov = F_jac @ torch.diag((self.q_t_log_std_list[self.T - 1] * 2).exp()) @ F_jac.t() + F_cov
-
                 self.q_t_log_std_list.append(nn.Parameter(pred_cov.detach().diag().log() / 2))
 
         elif self.phi_t_init_method == "EKF":
@@ -95,7 +93,7 @@ class NonAmortizedModelBase(nn.Module):
             q_T_mean, q_T_cov = gaussian_posterior(y_T, pred_mean, pred_cov, G_jac, G_cov,
                                                    G_fn=partial(self.G_fn.G_mean_fn, t=self.T))
 
-            self.q_t_mean_list.append(nn.Parameter(q_T_mean.detach()))
+            self.q_t_mean_list.append(nn.Parameter(q_T_mean.detach()))    
             self.q_t_log_std_list.append(nn.Parameter(q_T_cov.detach().diag().log() / 2))
         else:
             assert False, "Invalid phi_t_init_method"
@@ -128,7 +126,16 @@ class NonAmortizedModelBase(nn.Module):
         q_T_mean = self.q_t_mean_list[T].expand(num_samples, self.xdim)
         q_T_std = self.q_t_log_std_list[T].exp().expand(num_samples, self.xdim)
         q_T_stats = [q_T_mean, q_T_std]
-
+        '''
+        if torch.isnan(q_T_std).any():
+            print(self.q_t_log_std_list[T])
+            print('qTs:', q_T_std)
+            raise ValueError("Tensor q_T_std contains NaN values. Stopping compilation.")
+        # Check if q_T_mean has NaN values
+        if torch.isnan(q_T_mean).any():
+            print('qTm:', q_T_mean)
+            raise ValueError("Tensor q_T_mean contains NaN values. Stopping compilation.")
+        '''
         eps_x_T = torch.randn(num_samples, self.xdim).to(self.device)
         x_T = q_T_mean + q_T_std * eps_x_T
 
@@ -177,7 +184,7 @@ class NonAmortizedModelBase(nn.Module):
     def sample_joint_q_t(self, num_samples, num_steps_back, detach_x=False, T=None):
         """
             Sample num_samples from
-            q(x_T) \prod_{t= T - num_steps_back}^{T-1} q(x_t | x_{t+1})
+            q(x_T) \prod_{t= T - num_steps_back}^{T-1} k(x_t | x_{t+1})
             If detach_x is true then all x samples are detached
         """
         if T is None:
@@ -204,20 +211,6 @@ class NonAmortizedModelBase(nn.Module):
             log_p_x_t = self.p_0_dist().log_prob(x_t).unsqueeze(1)
         else:
             log_p_x_t = self.F_fn(x_tm1, t-1).log_prob(x_t).unsqueeze(1)
-        log_p_y_t = self.G_fn(x_t, t).log_prob(y_t).unsqueeze(1)
-        return {"log_p_x_t": log_p_x_t, "log_p_y_t": log_p_y_t}
-
-    def compute_log_p_t_with_score(self, x_t, y_t, s_tm1=None, x_tm1=None, t=None):
-        """
-            Compute log p(x_t | x_{t-1}, s_{t-1}) and log p(y_t | x_t)
-            t is set to self.T if not specified
-        """
-        if t is None:
-            t = self.T
-        if t == 0:
-            log_p_x_t = self.p_0_dist().log_prob(x_t).unsqueeze(1)
-        else:
-            log_p_x_t = self.F_fn(x_tm1, s_tm1, t-1).log_prob(x_t).unsqueeze(1)
         log_p_y_t = self.G_fn(x_t, t).log_prob(y_t).unsqueeze(1)
         return {"log_p_x_t": log_p_x_t, "log_p_y_t": log_p_y_t}
 
@@ -260,7 +253,7 @@ class NonAmortizedModelBase(nn.Module):
     def sample_and_compute_joint_r_t(self, y, num_samples, window_size, detach_x=False, only_return_first_r=False,
                                      T=None):
         """
-            Sample from q(x_T) q(x_{(T-window_size):(T-1)} | x_T) and compute r_{(T-window_size+1):T}
+            Sample from q(x_T) k(x_{(T-window_size):(T-1)} | x_T) and compute r_{(T-window_size+1):T}
             as well as other useful quantities
         """
         if T is None:
@@ -299,38 +292,6 @@ class NonAmortizedModelBase(nn.Module):
 
         for t in range(T):
             y_t = self.G_fn(x[t, :], t).sample()
-            x_tp1 = self.F_fn(x[t, :], t).sample()
-
-            y[t, :] = y_t
-            if t < T-1:
-                x[t+1, :] = x_tp1
-
-        return x, y
-
-    def score_function(self, x, y):
-        '''
-        For y = N(G(x),V(x))
-        s_{t} = -\frac{1}{2} [ \frac{V'(x_{t})}{V(x_{t})}  +  \frac{G'(x_{t})V(x_{t})-G(x_{t})V'(x_{t})}{V(x_{t})^{2}}    ]
-        '''
-        G_x = self.G_fn(x)
-        G_prime = torch.autograd.grad(G_x, x, grad_outputs=torch.ones_like(G_x_t), retain_graph=True)[0]
-
-        s = G_x/G_prime
-
-        return s
-
-
-    def generate_data_with_score(self, T):
-        # Generates hidden states and observations up to time T
-        x = torch.zeros((T, self.xdim)).to(self.device)
-        s = torch.zeros((T, self.xdim)).to(self.device)
-        y = torch.zeros((T, self.ydim)).to(self.device)
-
-        x[0, :] = self.p_0_dist().sample()
-
-        for t in range(T):
-            y_t = self.G_fn(x[t, :], t).sample()
-            s_t = score_function(y_t)
             x_tp1 = self.F_fn(x[t, :], t).sample()
 
             y[t, :] = y_t
@@ -883,7 +844,7 @@ class KernelRidgeRegressor(nn.Module):
             self.update_K()
 
         # this computes G.t() @ K^{-1}
-        GKinv = torch.solve(G, self.K)[0].t()
+        GKinv = torch.linalg.solve(G, self.K)[0].t()
 
         if not self.centre_elbo:
             if index is None:

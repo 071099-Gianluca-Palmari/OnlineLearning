@@ -1,9 +1,12 @@
 defaults:
   - globals
-  - data: linear_gaussian_for_config1.yaml
+  - data: linear_gaussian_for_config1
+  - phi_training: V_function1.yaml
+  - theta_training: kernel1.yaml
 
-name: "Theta_training"
+name: "Train"
 
 device: "cpu"
 seed: null
 save_models: True
+save_data: True
